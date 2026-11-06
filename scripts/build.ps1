@@ -54,7 +54,14 @@ python -m PyInstaller `
     --hidden-import "spettest.stable" `
     --hidden-import "spettest.report" `
     --hidden-import "spettest.errors" `
+    --hidden-import "spettest.netinfo" `
+    --hidden-import "spettest.storage" `
+    --hidden-import "spettest.paths" `
+    --hidden-import "spettest.gui" `
+    --hidden-import "spettest.progress" `
+    --hidden-import "customtkinter" `
     --collect-all "certifi" `
+    --collect-all "customtkinter" `
     $Entry
 
 $ExeName = "$AppName.exe"

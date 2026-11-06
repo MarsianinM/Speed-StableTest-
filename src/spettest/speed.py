@@ -9,23 +9,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from spettest.errors import SpetTestError
-from spettest.report import SpeedResult, print_info
+from spettest.progress import OnProgress, default_console_progress
+from spettest.report import SpeedResult
 
 DOWN_URL = "https://speed.cloudflare.com/__down"
 UP_URL = "https://speed.cloudflare.com/__up"
 LATENCY_URL = "https://speed.cloudflare.com/__down?bytes=0"
 
-# Тривалість як у браузерних тестах: прогрів + вимірювальне вікно.
 DOWNLOAD_THREADS = 8
 UPLOAD_THREADS = 6
 WARMUP_S = 2.0
 MEASURE_S = 10.0
-DOWN_CHUNK_BYTES = 25_000_000  # 25 МБ на запит; повторюємо до кінця вікна
-UP_CHUNK_BYTES = 4_000_000  # менший шматок, щоб частіше потрапляти у вікно виміру
+DOWN_CHUNK_BYTES = 25_000_000
+UP_CHUNK_BYTES = 4_000_000
 UP_CHUNK_BLOCK = 256 * 1024
 
 CONNECT_TIMEOUT_S = 10
 READ_TIMEOUT_S = 90
+PING_CONNECT_TIMEOUT_S = 2
+PING_READ_TIMEOUT_S = 2
 LATENCY_WARMUPS = 2
 LATENCY_SAMPLES = 12
 USER_AGENT = "SpetTest/0.1 (+portable speed test)"
@@ -47,25 +49,49 @@ def _session() -> requests.Session:
     return session
 
 
-def _measure_ping_ms(session: requests.Session) -> float:
-    """HTTPS RTT після warmup. Беремо мінімум (ближче до «найкращого» ping)."""
+def _measure_ping_ms(
+    session: requests.Session,
+    on_progress: OnProgress | None = None,
+) -> float:
+    """Кілька HTTPS RTT з проміжним прогресом (щоб GUI не виглядав «завислим»)."""
     samples: list[float] = []
+    total_steps = LATENCY_WARMUPS + LATENCY_SAMPLES
     try:
-        for _ in range(LATENCY_WARMUPS):
-            session.get(LATENCY_URL, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S))
-        for _ in range(LATENCY_SAMPLES):
+        for i in range(LATENCY_WARMUPS):
+            if on_progress:
+                on_progress(
+                    "Ping",
+                    progress=0.02 + 0.08 * (i / max(total_steps, 1)),
+                    mbps=None,
+                    detail=f"прогрів {i + 1}/{LATENCY_WARMUPS}",
+                )
+            session.get(
+                LATENCY_URL,
+                timeout=(PING_CONNECT_TIMEOUT_S, PING_READ_TIMEOUT_S),
+            )
+        for i in range(LATENCY_SAMPLES):
             started = time.perf_counter()
-            response = session.get(LATENCY_URL, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S))
+            response = session.get(
+                LATENCY_URL,
+                timeout=(PING_CONNECT_TIMEOUT_S, PING_READ_TIMEOUT_S),
+            )
             response.raise_for_status()
-            # З’їдаємо тіло (bytes=0 — майже порожнє), щоб не змішувати з наступним.
             _ = response.content
-            samples.append((time.perf_counter() - started) * 1000.0)
+            sample_ms = (time.perf_counter() - started) * 1000.0
+            samples.append(sample_ms)
+            if on_progress:
+                step = LATENCY_WARMUPS + i + 1
+                on_progress(
+                    "Ping",
+                    progress=0.02 + 0.12 * (step / max(total_steps, 1)),
+                    mbps=None,
+                    detail=f"зразок {i + 1}/{LATENCY_SAMPLES} · {sample_ms:.0f} мс",
+                )
     except requests.RequestException as exc:
         raise _friendly_network_error(exc) from exc
 
     if not samples:
         raise SpetTestError("Не вдалося виміряти затримку (ping).")
-    # Після warmup — мінімум (типово для «ping» у HTTP-тестах).
     return float(min(samples))
 
 
@@ -77,7 +103,6 @@ def _download_worker(
     counter: list[int],
     lock: threading.Lock,
 ) -> None:
-    """Качає чанками, поки не скінчиться загальний час; байти після warmup ідуть у лічильник."""
     url = f"{DOWN_URL}?bytes={DOWN_CHUNK_BYTES}"
     while time.perf_counter() < deadline:
         try:
@@ -97,14 +122,12 @@ def _download_worker(
                     with lock:
                         counter[0] += len(chunk)
         except requests.RequestException:
-            # Одна невдала спроба не валить увесь тест — пробуємо далі до deadline.
             if time.perf_counter() >= deadline:
                 break
             time.sleep(0.05)
 
 
 def _upload_body(nbytes: int, deadline: float):
-    """Генератор тіла upload; обривається по deadline."""
     sent = 0
     block = b"0" * UP_CHUNK_BLOCK
     while sent < nbytes and time.perf_counter() < deadline:
@@ -132,7 +155,6 @@ def _upload_worker(
             )
             response.raise_for_status()
             after = time.perf_counter()
-            # У вимірювальне вікно зараховуємо лише перетин [measure_start, deadline].
             overlap_start = max(before, measure_start)
             overlap_end = min(after, deadline)
             if overlap_end > overlap_start and after > before:
@@ -147,13 +169,14 @@ def _upload_worker(
             time.sleep(0.05)
 
 
-def _timed_parallel_transfer(label: str, worker, threads: int) -> float:
-    """
-    Паралельні потоки протягом WARMUP+MEASURE секунд.
-    Швидкість рахується лише за MEASURE_S після прогріву (насичення TCP).
-    """
+def _timed_parallel_transfer(
+    label: str,
+    worker,
+    threads: int,
+    on_progress: OnProgress,
+) -> float:
     total_s = WARMUP_S + MEASURE_S
-    print_info(f"  {label} (~{total_s:.0f} с, {threads} потоків)…")
+    on_progress(label, progress=0.0, mbps=None, detail=f"~{total_s:.0f} с, {threads} потоків")
 
     sessions = [_session() for _ in range(threads)]
     counter = [0]
@@ -161,7 +184,22 @@ def _timed_parallel_transfer(label: str, worker, threads: int) -> float:
     t0 = time.perf_counter()
     measure_start = t0 + WARMUP_S
     deadline = t0 + total_s
+    stop = threading.Event()
 
+    def _reporter() -> None:
+        while not stop.wait(0.4):
+            now = time.perf_counter()
+            frac = min(1.0, max(0.0, (now - t0) / total_s))
+            measured = max(0.0, now - measure_start)
+            with lock:
+                bytes_now = counter[0]
+            mbps = None
+            if measured > 0.3 and bytes_now > 0:
+                mbps = (bytes_now * 8) / measured / 1_000_000
+            on_progress(label, progress=frac, mbps=mbps, detail="")
+
+    reporter = threading.Thread(target=_reporter, daemon=True)
+    reporter.start()
     try:
         with ThreadPoolExecutor(max_workers=threads) as pool:
             futures = [
@@ -173,28 +211,37 @@ def _timed_parallel_transfer(label: str, worker, threads: int) -> float:
                 exc = future.exception()
                 if exc is not None:
                     errors.append(exc)
-            # Якщо жоден байт не зараховано і були винятки — показуємо мережеву помилку.
             if counter[0] <= 0 and errors:
                 raise _friendly_network_error(errors[0])
     finally:
+        stop.set()
+        reporter.join(timeout=1.0)
         for session in sessions:
             session.close()
 
     if counter[0] <= 0:
         raise SpetTestError(f"Не вдалося виміряти {label.lower()}.")
 
-    # Час виміру фіксований MEASURE_S (не wall clock усього тесту).
-    return (counter[0] * 8) / MEASURE_S / 1_000_000
+    mbps = (counter[0] * 8) / MEASURE_S / 1_000_000
+    on_progress(label, progress=1.0, mbps=mbps, detail="готово")
+    return mbps
 
 
-def run_speed_test() -> SpeedResult:
+def run_speed_test(on_progress: OnProgress | None = None) -> SpeedResult:
     """Download + upload + ping. Джиттер / втрати тут не рахуються."""
-    print_info("  Ping…")
-    with _session() as session:
-        ping_ms = _measure_ping_ms(session)
+    progress = on_progress or default_console_progress
 
-    download_mbps = _timed_parallel_transfer("Download", _download_worker, DOWNLOAD_THREADS)
-    upload_mbps = _timed_parallel_transfer("Upload", _upload_worker, UPLOAD_THREADS)
+    progress("Ping", progress=0.02, mbps=None, detail="старт")
+    with _session() as session:
+        ping_ms = _measure_ping_ms(session, on_progress=progress)
+    progress("Ping", progress=0.15, mbps=None, detail=f"готово · {ping_ms:.0f} мс")
+
+    download_mbps = _timed_parallel_transfer(
+        "Download", _download_worker, DOWNLOAD_THREADS, progress
+    )
+    upload_mbps = _timed_parallel_transfer(
+        "Upload", _upload_worker, UPLOAD_THREADS, progress
+    )
 
     return SpeedResult(
         download_mbps=download_mbps,

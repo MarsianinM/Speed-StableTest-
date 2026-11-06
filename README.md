@@ -1,12 +1,23 @@
 # SpetTestMy
 
-Портативна консольна утиліта для Windows: окремий замір **швидкості** і окрема перевірка **стабільності** каналу. Запуск з флешки без встановленого Python на цільовому ПК.
+Portable Windows utility: a separate **speed** test and a separate channel **stability** check (latency / jitter / loss). Runs from a USB flash drive without Python installed on the target PC.
 
-Документація: [docs/TZ.md](docs/TZ.md), [docs/TODO.md](docs/TODO.md).
+Includes a dark **CustomTkinter GUI** with simple progress, public IP detection, and local SQLite history (`spettest.db` next to the app — no cloud sync).
 
-## Розробка
+Local docs (if present on your machine): `docs/TZ.md`, `docs/TODO.md` (not published to git).
 
-Потрібен Python 3.11+.
+## Features
+
+| Mode | What it does |
+|------|----------------|
+| **Speed** | Download / Upload / Ping via Cloudflare (multi-stream, warmup window) |
+| **Stability** | HTTPS latency series, RFC 3550 jitter, loss %, verdict |
+| **GUI** | Dark theme, stage + progress bar, live Mbps, history with date/IP filter |
+| **CLI** | `speed` and `stable [seconds]` still available |
+
+## Development
+
+Requires Python 3.11+.
 
 ```powershell
 cd SpetTestMy
@@ -15,7 +26,7 @@ python -m venv .venv
 pip install -e .
 ```
 
-Запуск:
+### CLI
 
 ```powershell
 python -m spettest speed
@@ -23,23 +34,52 @@ python -m spettest stable
 python -m spettest stable 120
 ```
 
-Або без editable-install:
+Or without an editable install:
 
 ```powershell
 $env:PYTHONPATH = "src"
 python -m spettest speed
 ```
 
-## Портативні ярлики
+### GUI
 
-Шаблони для флешки: папка [`portable/`](portable/) — `Швидкість.cmd`, `Стабільність.cmd`, `README.txt`.  
-Працюють після збірки exe (етап 5): потрапляють у `dist/SpetTest/` поруч із `SpetTest.exe`.
+```powershell
+$env:PYTHONPATH = "src"
+python -m spettest
+```
 
-## Збірка для флешки
+### Progress gap diagnostic (optional)
+
+Checks how long the UI/callback stays silent between updates (useful if the window feels “frozen” during ping/stability):
+
+```powershell
+$env:PYTHONPATH = "src"
+python scripts/check_progress_gaps.py stable 10
+python scripts/check_progress_gaps.py
+```
+
+## Portable launchers
+
+Templates in [`portable/`](portable/):
+
+- `Інтерфейс.cmd` — GUI (`SpetTest.exe` with no args)
+- `Швидкість.cmd` — CLI speed
+- `Стабільність.cmd` — CLI stability (~60 s)
+- `README.txt` — end-user notes (Ukrainian)
+
+After build they are copied into `dist/SpetTest/` next to `SpetTest.exe`.
+
+## Build for USB
 
 ```powershell
 .\scripts\build.ps1
 ```
 
-Результат: `dist/SpetTest/` (`SpetTest.exe`, `Швидкість.cmd`, `Стабільність.cmd`, `README.txt`).  
-Скопіюйте **всю** цю папку на флешку. Режим `--onefile` заборонений.
+Output: `dist/SpetTest/` with `SpetTest.exe`, `_internal/`, all `.cmd` launchers, and `README.txt`.  
+Copy the **entire** folder to the flash drive. `--onefile` mode is not allowed.
+
+## Dependencies (dev/build only)
+
+- `requests`
+- `customtkinter`
+- `pyinstaller` (for packaging)

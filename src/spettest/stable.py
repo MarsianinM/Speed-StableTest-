@@ -7,16 +7,17 @@ import time
 import requests
 
 from spettest.errors import SpetTestError
-from spettest.report import StableResult, print_info
+from spettest.progress import OnProgress, default_console_progress
+from spettest.report import StableResult
 
 DEFAULT_DURATION_S = 60
 LATENCY_URL = "https://speed.cloudflare.com/__down?bytes=0"
 SAMPLE_INTERVAL_S = 0.5
-CONNECT_TIMEOUT_S = 5
-READ_TIMEOUT_S = 5
+# Коротші таймаути: один «важкий» запит не блокує прогрес GUI надовго.
+CONNECT_TIMEOUT_S = 2
+READ_TIMEOUT_S = 2
 USER_AGENT = "SpetTest/0.1 (+portable stability test)"
 
-# Пороги вердикту (ТЗ §5.2)
 GOOD_LOSS_PCT = 1.0
 GOOD_JITTER_MS = 10.0
 GOOD_PING_MS = 50.0
@@ -42,7 +43,6 @@ def _session() -> requests.Session:
 
 
 def _one_latency_ms(session: requests.Session) -> float | None:
-    """Один короткий HTTPS GET. None = втрата / помилка спроби."""
     try:
         started = time.perf_counter()
         response = session.get(
@@ -58,11 +58,6 @@ def _one_latency_ms(session: requests.Session) -> float | None:
 
 
 def _rfc3550_jitter_ms(samples_ms: list[float]) -> float:
-    """
-    Jitter за RFC 3550:
-    J = J + (|D(i-1,i)| - J) / 16,
-    де D ≈ різниця RTT сусідніх успішних замірів.
-    """
     if len(samples_ms) < 2:
         return 0.0
     jitter = 0.0
@@ -90,18 +85,22 @@ def _verdict(loss_percent: float, jitter_ms: float, ping_avg_ms: float) -> str:
     return "погана"
 
 
-def run_stable_test(duration_s: int = DEFAULT_DURATION_S) -> StableResult:
+def run_stable_test(
+    duration_s: int = DEFAULT_DURATION_S,
+    on_progress: OnProgress | None = None,
+) -> StableResult:
     """Серія HTTPS-замірів затримки. Без ICMP і без великих download/upload."""
     if duration_s <= 0:
         raise SpetTestError("Тривалість має бути додатним числом секунд.")
 
+    progress = on_progress or default_console_progress
     successes: list[float] = []
     attempts = 0
-    deadline = time.perf_counter() + duration_s
-    last_progress_bucket = -1
+    t0 = time.perf_counter()
+    deadline = t0 + duration_s
+    last_emit = -1
 
     with _session() as session:
-        # Warm-up: встановлюємо TCP/TLS, щоб серія міряла канал, а не хендшейк.
         try:
             warm = session.get(
                 LATENCY_URL,
@@ -111,7 +110,12 @@ def run_stable_test(duration_s: int = DEFAULT_DURATION_S) -> StableResult:
         except requests.RequestException as exc:
             raise _friendly_network_error(exc) from exc
 
-        print_info(f"  Збір замірів протягом {duration_s} с…")
+        progress(
+            "Збір замірів",
+            progress=0.0,
+            mbps=None,
+            detail=f"0/{duration_s} с",
+        )
 
         while True:
             now = time.perf_counter()
@@ -123,13 +127,22 @@ def run_stable_test(duration_s: int = DEFAULT_DURATION_S) -> StableResult:
             if sample is not None:
                 successes.append(sample)
 
-            elapsed = int(now - (deadline - duration_s))
-            bucket = elapsed // 5
-            if bucket > last_progress_bucket and elapsed > 0:
-                last_progress_bucket = bucket
-                print_info(
-                    f"  …{min(elapsed, duration_s)}/{duration_s} с, "
-                    f"успішних {len(successes)}/{attempts}"
+            # Прогрес після кожного запиту (не до нього) — UI не «мовчить» на довгому RTT.
+            after = time.perf_counter()
+            elapsed = int(after - t0)
+            frac = min(1.0, (after - t0) / duration_s)
+            last_ms = f"{sample:.0f} мс" if sample is not None else "втрата"
+            # Оновлення щонайменше раз на секунду або на кожній 2-й спробі.
+            if elapsed != last_emit or attempts % 2 == 0:
+                last_emit = elapsed
+                progress(
+                    "Збір замірів",
+                    progress=frac,
+                    mbps=None,
+                    detail=(
+                        f"{min(elapsed, duration_s)}/{duration_s} с · "
+                        f"успішних {len(successes)}/{attempts} · останній {last_ms}"
+                    ),
                 )
 
             remaining = deadline - time.perf_counter()
@@ -152,6 +165,8 @@ def run_stable_test(duration_s: int = DEFAULT_DURATION_S) -> StableResult:
     ping_max = max(successes)
     jitter = _rfc3550_jitter_ms(successes)
     verdict = _verdict(loss_percent, jitter, ping_avg)
+
+    progress("Збір замірів", progress=1.0, mbps=None, detail="готово")
 
     return StableResult(
         duration_s=duration_s,

@@ -43,6 +43,13 @@ def print_error(message: str) -> None:
     print(f"Помилка: {message}", file=sys.stderr)
 
 
+def print_public_ip(ip: str | None) -> None:
+    if ip:
+        print(f"Публічний IP: {ip}")
+    else:
+        print("Публічний IP: не визначено")
+
+
 def print_speed(result: SpeedResult) -> None:
     print("=== Швидкість ===")
     print(f"Download:  {result.download_mbps:.1f} Мбіт/с")
