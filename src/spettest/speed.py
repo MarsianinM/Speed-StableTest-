@@ -32,9 +32,9 @@ UP_MIN_REMAINING_S = 0.3
 CONNECT_TIMEOUT_S = 10
 READ_TIMEOUT_S = 90
 UPLOAD_CONNECT_TIMEOUT_S = 5
-UPLOAD_READ_TIMEOUT_S = 8
-PING_CONNECT_TIMEOUT_S = 2
-PING_READ_TIMEOUT_S = 2
+UPLOAD_READ_TIMEOUT_S = 15
+PING_CONNECT_TIMEOUT_S = 5
+PING_READ_TIMEOUT_S = 5
 LATENCY_WARMUPS = 2
 LATENCY_SAMPLES = 12
 USER_AGENT = "SpetTest/0.1 (+portable speed test)"
@@ -60,45 +60,62 @@ def _measure_ping_ms(
     session: requests.Session,
     on_progress: OnProgress | None = None,
 ) -> float:
-    """Кілька HTTPS RTT з проміжним прогресом (щоб GUI не виглядав «завислим»)."""
+    """Кілька HTTPS RTT. Один повільний/таймаутний зразок не валить увесь тест."""
     samples: list[float] = []
     total_steps = LATENCY_WARMUPS + LATENCY_SAMPLES
-    try:
-        for i in range(LATENCY_WARMUPS):
-            if on_progress:
-                on_progress(
-                    "Ping",
-                    progress=0.02 + 0.08 * (i / max(total_steps, 1)),
-                    mbps=None,
-                    detail=f"прогрів {i + 1}/{LATENCY_WARMUPS}",
-                )
-            session.get(
-                LATENCY_URL,
-                timeout=(PING_CONNECT_TIMEOUT_S, PING_READ_TIMEOUT_S),
+    ping_timeout = (PING_CONNECT_TIMEOUT_S, PING_READ_TIMEOUT_S)
+
+    for i in range(LATENCY_WARMUPS):
+        if on_progress:
+            on_progress(
+                "Ping",
+                progress=0.02 + 0.08 * (i / max(total_steps, 1)),
+                mbps=None,
+                detail=f"прогрів {i + 1}/{LATENCY_WARMUPS}",
             )
-        for i in range(LATENCY_SAMPLES):
+        try:
+            session.get(LATENCY_URL, timeout=ping_timeout)
+        except requests.RequestException:
+            # Прогрів опційний — йдемо далі до замірів.
+            continue
+
+    for i in range(LATENCY_SAMPLES):
+        if on_progress:
+            step = LATENCY_WARMUPS + i + 1
+            on_progress(
+                "Ping",
+                progress=0.02 + 0.12 * (step / max(total_steps, 1)),
+                mbps=None,
+                detail=f"зразок {i + 1}/{LATENCY_SAMPLES}…",
+            )
+        try:
             started = time.perf_counter()
-            response = session.get(
-                LATENCY_URL,
-                timeout=(PING_CONNECT_TIMEOUT_S, PING_READ_TIMEOUT_S),
-            )
+            response = session.get(LATENCY_URL, timeout=ping_timeout)
             response.raise_for_status()
             _ = response.content
             sample_ms = (time.perf_counter() - started) * 1000.0
             samples.append(sample_ms)
             if on_progress:
-                step = LATENCY_WARMUPS + i + 1
                 on_progress(
                     "Ping",
                     progress=0.02 + 0.12 * (step / max(total_steps, 1)),
                     mbps=None,
                     detail=f"зразок {i + 1}/{LATENCY_SAMPLES} · {sample_ms:.0f} мс",
                 )
-    except requests.RequestException as exc:
-        raise _friendly_network_error(exc) from exc
+        except requests.RequestException:
+            if on_progress:
+                on_progress(
+                    "Ping",
+                    progress=0.02 + 0.12 * ((LATENCY_WARMUPS + i + 1) / max(total_steps, 1)),
+                    mbps=None,
+                    detail=f"зразок {i + 1}/{LATENCY_SAMPLES} · пропуск",
+                )
+            continue
 
     if not samples:
-        raise SpetTestError("Не вдалося виміряти затримку (ping).")
+        raise SpetTestError(
+            "Не вдалося виміряти затримку (ping). Перевірте з’єднання з інтернетом."
+        )
     return float(min(samples))
 
 
@@ -244,8 +261,13 @@ def _timed_parallel_transfer(
                 session.close()
             except Exception:
                 pass
-        if counter[0] <= 0 and errors:
-            raise _friendly_network_error(errors[0])
+        # Таймаути після hard_stop / закриття сесій — очікувані, не валимо фазу.
+        fatal = [
+            e for e in errors
+            if not isinstance(e, (requests.Timeout, requests.ConnectionError))
+        ]
+        if counter[0] <= 0 and fatal:
+            raise _friendly_network_error(fatal[0])
     finally:
         stop.set()
         reporter.join(timeout=1.0)
@@ -257,7 +279,9 @@ def _timed_parallel_transfer(
                 pass
 
     if counter[0] <= 0:
-        raise SpetTestError(f"Не вдалося виміряти {label.lower()}.")
+        raise SpetTestError(
+            f"Не вдалося виміряти {label.lower()}. Перевірте з’єднання з інтернетом."
+        )
 
     # Швидкість завжди відносно фіксованого MEASURE_S (не wall-clock з хвостиком).
     mbps = (counter[0] * 8) / MEASURE_S / 1_000_000
