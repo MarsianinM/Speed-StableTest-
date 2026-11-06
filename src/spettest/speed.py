@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import requests
 
@@ -20,12 +20,19 @@ DOWNLOAD_THREADS = 8
 UPLOAD_THREADS = 6
 WARMUP_S = 2.0
 MEASURE_S = 10.0
+# Після дедлайну ще трохи чекаємо завершення потоків, далі — примусово закриваємо.
+PHASE_GRACE_S = 1.0
+
 DOWN_CHUNK_BYTES = 25_000_000
-UP_CHUNK_BYTES = 4_000_000
-UP_CHUNK_BLOCK = 256 * 1024
+# Помірні шматки upload: без довгого POST після дедлайну, але з нормальним насиченням.
+UP_CHUNK_BYTES = 1_000_000
+UP_CHUNK_BLOCK = 64 * 1024
+UP_MIN_REMAINING_S = 0.3
 
 CONNECT_TIMEOUT_S = 10
 READ_TIMEOUT_S = 90
+UPLOAD_CONNECT_TIMEOUT_S = 5
+UPLOAD_READ_TIMEOUT_S = 8
 PING_CONNECT_TIMEOUT_S = 2
 PING_READ_TIMEOUT_S = 2
 LATENCY_WARMUPS = 2
@@ -121,19 +128,22 @@ def _download_worker(
                 if now >= measure_start:
                     with lock:
                         counter[0] += len(chunk)
+            if time.perf_counter() >= deadline:
+                break
         except requests.RequestException:
             if time.perf_counter() >= deadline:
                 break
             time.sleep(0.05)
 
 
-def _upload_body(nbytes: int, deadline: float):
+def _upload_body(nbytes: int, deadline: float, sent_holder: list[int]):
     sent = 0
     block = b"0" * UP_CHUNK_BLOCK
     while sent < nbytes and time.perf_counter() < deadline:
         left = min(UP_CHUNK_BLOCK, nbytes - sent)
         yield block if left == UP_CHUNK_BLOCK else block[:left]
         sent += left
+        sent_holder[0] = sent
 
 
 def _upload_worker(
@@ -144,22 +154,33 @@ def _upload_worker(
     counter: list[int],
     lock: threading.Lock,
 ) -> None:
-    while time.perf_counter() < deadline:
+    """Короткі POST; не стартуємо новий, якщо часу майже не лишилось."""
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining < UP_MIN_REMAINING_S:
+            break
         try:
             before = time.perf_counter()
+            sent_holder = [0]
+            # Таймаут лише трохи довший за залишок фази — без очікування 90 с.
+            read_timeout = max(1.0, min(UPLOAD_READ_TIMEOUT_S, remaining + PHASE_GRACE_S))
             response = session.post(
                 UP_URL,
-                data=_upload_body(UP_CHUNK_BYTES, deadline),
+                data=_upload_body(UP_CHUNK_BYTES, deadline, sent_holder),
                 headers={"Content-Type": "application/octet-stream"},
-                timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
+                timeout=(UPLOAD_CONNECT_TIMEOUT_S, read_timeout),
             )
             response.raise_for_status()
             after = time.perf_counter()
+            sent = sent_holder[0]
+            if sent <= 0:
+                continue
+            # Зараховуємо лише байти в межах вікна виміру.
             overlap_start = max(before, measure_start)
             overlap_end = min(after, deadline)
             if overlap_end > overlap_start and after > before:
                 fraction = (overlap_end - overlap_start) / (after - before)
-                credited = int(UP_CHUNK_BYTES * fraction)
+                credited = int(sent * fraction)
                 if credited > 0:
                     with lock:
                         counter[0] += credited
@@ -184,13 +205,14 @@ def _timed_parallel_transfer(
     t0 = time.perf_counter()
     measure_start = t0 + WARMUP_S
     deadline = t0 + total_s
+    hard_stop = deadline + PHASE_GRACE_S
     stop = threading.Event()
 
     def _reporter() -> None:
         while not stop.wait(0.4):
             now = time.perf_counter()
             frac = min(1.0, max(0.0, (now - t0) / total_s))
-            measured = max(0.0, now - measure_start)
+            measured = max(0.0, min(now, deadline) - measure_start)
             with lock:
                 bytes_now = counter[0]
             mbps = None
@@ -200,28 +222,44 @@ def _timed_parallel_transfer(
 
     reporter = threading.Thread(target=_reporter, daemon=True)
     reporter.start()
+
+    pool = ThreadPoolExecutor(max_workers=threads)
+    errors: list[BaseException] = []
     try:
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            futures = [
-                pool.submit(worker, sessions[i], t0, measure_start, deadline, counter, lock)
-                for i in range(threads)
-            ]
-            errors: list[BaseException] = []
-            for future in as_completed(futures):
+        futures = [
+            pool.submit(worker, sessions[i], t0, measure_start, deadline, counter, lock)
+            for i in range(threads)
+        ]
+        pending = set(futures)
+        # Чекаємо максимум до hard_stop — upload більше не «тягне» фазу.
+        while pending and time.perf_counter() < hard_stop:
+            done, pending = wait(pending, timeout=0.2)
+            for future in done:
                 exc = future.exception()
                 if exc is not None:
                     errors.append(exc)
-            if counter[0] <= 0 and errors:
-                raise _friendly_network_error(errors[0])
+        # Обриваємо з’єднання, щоб звільнити потоки, що ще в POST/GET.
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if counter[0] <= 0 and errors:
+            raise _friendly_network_error(errors[0])
     finally:
         stop.set()
         reporter.join(timeout=1.0)
+        pool.shutdown(wait=False, cancel_futures=True)
         for session in sessions:
-            session.close()
+            try:
+                session.close()
+            except Exception:
+                pass
 
     if counter[0] <= 0:
         raise SpetTestError(f"Не вдалося виміряти {label.lower()}.")
 
+    # Швидкість завжди відносно фіксованого MEASURE_S (не wall-clock з хвостиком).
     mbps = (counter[0] * 8) / MEASURE_S / 1_000_000
     on_progress(label, progress=1.0, mbps=mbps, detail="готово")
     return mbps
