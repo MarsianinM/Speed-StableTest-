@@ -14,6 +14,7 @@ from spettest.report import SpeedResult, StableResult
 from spettest.speed import run_speed_test
 from spettest.stable import DEFAULT_DURATION_S, run_stable_test
 from spettest.storage import HistoryRow, count_history, list_history, save_speed, save_stable
+from spettest.suitability import evaluate_suitability, format_suitability
 
 
 class SpetTestApp(ctk.CTk):
@@ -23,12 +24,14 @@ class SpetTestApp(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("SpetTest")
-        self.geometry("720x640")
-        self.minsize(640, 560)
+        self.geometry("760x700")
+        self.minsize(660, 600)
 
         self._busy = False
         self._public_ip: str | None = None
         self._showing_history = True
+        self._last_speed: SpeedResult | None = None
+        self._last_stable: StableResult | None = None
 
         self._build()
         self.after(100, self._refresh_ip)
@@ -297,13 +300,22 @@ class SpetTestApp(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _suitability_text(self) -> str:
+        report = evaluate_suitability(
+            speed=self._last_speed,
+            stable=self._last_stable,
+        )
+        return format_suitability(report)
+
     def _on_speed_done(self, result: SpeedResult, ip: str | None) -> None:
+        self._last_speed = result
         text = (
             "=== Швидкість ===\n"
             f"Публічний IP: {ip or 'не визначено'}\n"
             f"Download:  {result.download_mbps:.1f} Мбіт/с\n"
             f"Upload:    {result.upload_mbps:.1f} Мбіт/с\n"
             f"Ping:      {result.ping_ms:.0f} мс\n"
+            f"\n{self._suitability_text()}\n"
         )
         self._set_text(self.result_box, text)
         self.stage_label.configure(text="Готово")
@@ -315,6 +327,7 @@ class SpetTestApp(ctk.CTk):
         self._set_busy(False)
 
     def _on_stable_done(self, result: StableResult, ip: str | None) -> None:
+        self._last_stable = result
         text = (
             "=== Стабільність ===\n"
             f"Публічний IP: {ip or 'не визначено'}\n"
@@ -324,6 +337,7 @@ class SpetTestApp(ctk.CTk):
             f"Jitter:     {result.jitter_ms:.1f} мс\n"
             f"Втрати:     {result.loss_percent:.1f}%\n"
             f"Стабільність: {result.verdict}\n"
+            f"\n{self._suitability_text()}\n"
         )
         self._set_text(self.result_box, text)
         self.stage_label.configure(text="Готово")

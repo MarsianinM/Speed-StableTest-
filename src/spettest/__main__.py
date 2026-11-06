@@ -15,10 +15,12 @@ from spettest.report import (
     print_public_ip,
     print_speed,
     print_stable,
+    print_suitability_block,
 )
 from spettest.speed import run_speed_test
 from spettest.stable import DEFAULT_DURATION_S, run_stable_test
 from spettest.storage import save_speed, save_stable
+from spettest.suitability import evaluate_suitability, format_suitability
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -58,6 +60,9 @@ def _run_cli(argv: Sequence[str]) -> int:
                 print_info("Результат збережено в локальну історію.")
             except Exception:
                 print_info("Не вдалося зберегти результат у історію (файл БД).")
+            print_suitability_block(
+                format_suitability(evaluate_suitability(speed=result, stable=None))
+            )
             return 0
 
         if args.command == "stable":
@@ -73,6 +78,9 @@ def _run_cli(argv: Sequence[str]) -> int:
                 print_info("Результат збережено в локальну історію.")
             except Exception:
                 print_info("Не вдалося зберегти результат у історію (файл БД).")
+            print_suitability_block(
+                format_suitability(evaluate_suitability(speed=None, stable=result))
+            )
             return 0
 
         print_error("Невідома команда.")

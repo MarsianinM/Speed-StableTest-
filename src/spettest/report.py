@@ -67,3 +67,8 @@ def print_stable(result: StableResult) -> None:
     print(f"Jitter:     {result.jitter_ms:.1f} мс")
     print(f"Втрати:     {result.loss_percent:.1f}%")
     print(f"Стабільність: {result.verdict}")
+
+
+def print_suitability_block(text: str) -> None:
+    print()
+    print(text)

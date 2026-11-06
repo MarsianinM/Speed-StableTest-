@@ -59,6 +59,7 @@ python -m PyInstaller `
     --hidden-import "spettest.paths" `
     --hidden-import "spettest.gui" `
     --hidden-import "spettest.progress" `
+    --hidden-import "spettest.suitability" `
     --hidden-import "customtkinter" `
     --collect-all "certifi" `
     --collect-all "customtkinter" `
